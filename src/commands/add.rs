@@ -1,9 +1,11 @@
 use crate::db::{self, commands_repo};
 use crate::models::StoredCommand;
-use crate::{interactive, paths, placeholder};
+use crate::{interactive, paths, placeholder, vars};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use nanoid::nanoid;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 pub fn run(template: String) -> Result<()> {
     let mut conn = db::open(paths::db_path()?)?;
@@ -36,7 +38,11 @@ pub fn run(template: String) -> Result<()> {
         updated_at: now,
     };
     commands_repo::insert_command(&mut conn, &cmd, &vars)?;
-
     println!("Saved. id: {id}");
+
+    if !vars.is_empty() {
+        let conn = Rc::new(conn);
+        vars::review_default_envs(&conn, &id, &vars, &HashMap::new())?;
+    }
     Ok(())
 }

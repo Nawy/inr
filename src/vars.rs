@@ -1,12 +1,13 @@
 use crate::crypto::{self, DerivedKey};
 use crate::db::{self, commands_repo, env_repo};
 use crate::interactive;
-use crate::models::{CmdVarKind, CmdVariable, EnvKind, StoredCommandVariable};
+use crate::models::{CmdVarKind, CmdVariable, EnvKind, StoredCommandVariable, StoredEnv};
 use crate::shell::{BindingSource, ResolvedVar};
 use crate::tui::{self, EnvLookupAutocomplete};
 use anyhow::{anyhow, Result};
 use inquire::{InquireError, Password, PasswordDisplayMode, Select, Text};
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::rc::Rc;
 use zeroize::Zeroizing;
 
@@ -226,6 +227,85 @@ fn resolve_secret_variable(
         value,
         source: BindingSource::Env(env.name.clone()),
     }))
+}
+
+/// What the user chose when asked about one variable's default env.
+pub enum DefaultEnvChoice {
+    /// Nothing selected that changes the current state (cancelled, or
+    /// explicitly kept as-is).
+    Unchanged,
+    /// Explicitly asked to remove the default.
+    Cleared,
+    /// Picked a (kind-compatible) env to use as the default from now on.
+    Set(StoredEnv),
+}
+
+/// Asks whether/how to set variable `var`'s default env, given its
+/// `current` value (if any and if it still resolves to a real env).
+/// Returns `Unchanged` on Esc/cancel at any point.
+pub fn prompt_default_env_choice(
+    conn: &Rc<Connection>,
+    var: &CmdVariable,
+    current: Option<&StoredEnv>,
+) -> Result<DefaultEnvChoice> {
+    let (message, options): (String, Vec<&str>) = match current {
+        Some(env) => (
+            format!("{} ({}) - default env is @{}:", var.name, var.kind, env.name),
+            vec!["Keep current default", "Change default env", "Remove default"],
+        ),
+        None => (
+            format!("{} ({}) - set a default env?", var.name, var.kind),
+            vec!["No default", "Set a default env"],
+        ),
+    };
+
+    let choice = Select::new(&message, options).prompt();
+    let choice = match choice {
+        Ok(c) => c,
+        Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+            return Ok(DefaultEnvChoice::Unchanged)
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    match choice {
+        "Keep current default" | "No default" => Ok(DefaultEnvChoice::Unchanged),
+        "Remove default" => Ok(DefaultEnvChoice::Cleared),
+        _ => {
+            let kind_filter = compatible_env_kinds(var.kind);
+            match tui::select_env(conn, &kind_filter, "Search envs:")? {
+                Some(env) => Ok(DefaultEnvChoice::Set(env)),
+                None => Ok(DefaultEnvChoice::Unchanged),
+            }
+        }
+    }
+}
+
+/// Walks each of a command's variables, offering to set/change/clear its
+/// default env, and persists whatever was chosen. `current_defaults` maps
+/// variable name -> its currently-set (and still-existing) default env;
+/// pass an empty map for a brand new command.
+pub fn review_default_envs(
+    conn: &Rc<Connection>,
+    command_id: &str,
+    vars: &[CmdVariable],
+    current_defaults: &HashMap<String, StoredEnv>,
+) -> Result<()> {
+    for var in vars {
+        let current = current_defaults.get(&var.name);
+        match prompt_default_env_choice(conn, var, current)? {
+            DefaultEnvChoice::Unchanged => {}
+            DefaultEnvChoice::Cleared => {
+                commands_repo::set_default_env(conn, command_id, &var.name, None)?;
+                println!("Default env cleared for '{}'.", var.name);
+            }
+            DefaultEnvChoice::Set(env) => {
+                commands_repo::set_default_env(conn, command_id, &var.name, Some(&env.id))?;
+                println!("Default env for '{}' set to @{}.", var.name, env.name);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
