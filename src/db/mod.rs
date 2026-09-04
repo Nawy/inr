@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS command_variables (
     position INTEGER NOT NULL,
     kind TEXT NOT NULL,
     name TEXT NOT NULL,
+    default_env_id TEXT,
     UNIQUE(command_id, name)
 );
 
@@ -93,9 +94,26 @@ pub fn open_in_memory() -> Result<Connection> {
     Ok(conn)
 }
 
+/// Adds columns introduced after a user's database was first created.
+/// `CREATE TABLE IF NOT EXISTS` (in `SCHEMA`) is a no-op on a table that
+/// already exists, so a pre-existing `command_variables` table never picks
+/// up new columns on its own - this patches it in, once, idempotently.
+/// Existing rows get NULL, which the rest of the code already treats as
+/// "no default env set".
+fn migrate_schema(conn: &Connection) -> Result<()> {
+    let has_default_env_id: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('command_variables') WHERE name = 'default_env_id'")?
+        .exists([])?;
+    if !has_default_env_id {
+        conn.execute("ALTER TABLE command_variables ADD COLUMN default_env_id TEXT", [])?;
+    }
+    Ok(())
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.execute_batch(SCHEMA)?;
+    migrate_schema(conn)?;
     Ok(())
 }
 
@@ -166,5 +184,43 @@ mod tests {
         assert!(is_initialized(&conn).unwrap());
         let loaded = load_config(&conn).unwrap().unwrap();
         assert_eq!(loaded.kdf_salt, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn migrate_schema_adds_default_env_id_to_pre_existing_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE commands (
+                id TEXT PRIMARY KEY,
+                template TEXT NOT NULL,
+                description TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE command_variables (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                command_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+
+        migrate_schema(&conn).unwrap();
+
+        let has_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('command_variables') WHERE name = 'default_env_id'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has_column);
+    }
+
+    #[test]
+    fn migrate_schema_is_idempotent_when_column_already_present() {
+        let conn = open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        migrate_schema(&conn).unwrap();
     }
 }
