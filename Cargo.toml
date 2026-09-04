@@ -2,6 +2,10 @@
 name = "inr"
 version = "0.1.0"
 edition = "2024"
+description = "A secure, searchable command-line vault for shell commands, secrets, and env variables"
+license = "MIT"
+repository = "https://github.com/Nawy/inr"
+homepage = "https://github.com/Nawy/inr"
 
 [dependencies]
 aes-gcm = { version = "0.11.1", features = ["aes", "rand_core"] }
@@ -21,3 +25,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 shell-words = "1.1.1"
 zeroize = "1.9.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
