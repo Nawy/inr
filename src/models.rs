@@ -147,6 +147,45 @@ pub struct StoredEnv {
     pub updated_at: String,
 }
 
+/// A command variable as actually stored in the DB: name/kind plus its
+/// optional default env. `default_env_id` is an unconstrained id (no FK) -
+/// the env it points to may have been deleted since; that's resolved
+/// lazily by whoever reads it (`vars::resolve_variable`), never tracked or
+/// cascaded here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCommandVariable {
+    pub var: CmdVariable,
+    pub default_env_id: Option<String>,
+}
+
+/// Result of comparing a command's previously-stored variables against a
+/// freshly re-parsed set from an edited template, matched by (name, kind).
+/// Used by `inr e` to summarize what will change before saving - a
+/// variable whose name is reused with a different kind counts as one
+/// removal plus one addition, never a "kept".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariableDiff {
+    pub kept: Vec<CmdVariable>,
+    pub added: Vec<CmdVariable>,
+    pub removed: Vec<StoredCommandVariable>,
+}
+
+impl VariableDiff {
+    pub fn is_unchanged(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
+pub fn diff_variables(old: &[StoredCommandVariable], new: &[CmdVariable]) -> VariableDiff {
+    let matches = |o: &StoredCommandVariable, n: &CmdVariable| o.var.name == n.name && o.var.kind == n.kind;
+
+    let kept = new.iter().filter(|n| old.iter().any(|o| matches(o, n))).cloned().collect();
+    let added = new.iter().filter(|n| !old.iter().any(|o| matches(o, n))).cloned().collect();
+    let removed = old.iter().filter(|o| !new.iter().any(|n| matches(o, n))).cloned().collect();
+
+    VariableDiff { kept, added, removed }
+}
+
 /// A single variable's record within one history entry. `display` is
 /// either the literal typed value (text/number), "@envname" (value pulled
 /// from an env, any kind), or a hidden marker for a secret typed directly -
@@ -203,5 +242,56 @@ mod tests {
         assert!(EnvKind::NumberFloat.compatible_with(CmdVarKind::Number));
         assert!(EnvKind::NumberInt.compatible_with(CmdVarKind::Number));
         assert!(!EnvKind::Text.compatible_with(CmdVarKind::Number));
+    }
+
+    fn cmdvar(kind: CmdVarKind, name: &str) -> CmdVariable {
+        CmdVariable { kind, name: name.to_string() }
+    }
+
+    fn stored(kind: CmdVarKind, name: &str, default_env_id: Option<&str>) -> StoredCommandVariable {
+        StoredCommandVariable {
+            var: cmdvar(kind, name),
+            default_env_id: default_env_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn diff_variables_classifies_kept_added_removed() {
+        let old = vec![
+            stored(CmdVarKind::Text, "host", Some("env1")),
+            stored(CmdVarKind::Secret, "token", None),
+        ];
+        let new = vec![
+            cmdvar(CmdVarKind::Text, "host"),  // kept (same name+kind)
+            cmdvar(CmdVarKind::Number, "port"), // added
+            // "token" is gone -> removed
+        ];
+
+        let diff = diff_variables(&old, &new);
+        assert_eq!(diff.kept, vec![cmdvar(CmdVarKind::Text, "host")]);
+        assert_eq!(diff.added, vec![cmdvar(CmdVarKind::Number, "port")]);
+        assert_eq!(diff.removed, vec![stored(CmdVarKind::Secret, "token", None)]);
+        assert!(!diff.is_unchanged());
+    }
+
+    #[test]
+    fn diff_variables_treats_kind_change_as_remove_plus_add() {
+        let old = vec![stored(CmdVarKind::Text, "count", Some("env1"))];
+        let new = vec![cmdvar(CmdVarKind::Number, "count")];
+
+        let diff = diff_variables(&old, &new);
+        assert!(diff.kept.is_empty());
+        assert_eq!(diff.added, vec![cmdvar(CmdVarKind::Number, "count")]);
+        assert_eq!(diff.removed, vec![stored(CmdVarKind::Text, "count", Some("env1"))]);
+    }
+
+    #[test]
+    fn diff_variables_identical_sets_is_unchanged() {
+        let old = vec![stored(CmdVarKind::Text, "host", None)];
+        let new = vec![cmdvar(CmdVarKind::Text, "host")];
+
+        let diff = diff_variables(&old, &new);
+        assert!(diff.is_unchanged());
+        assert_eq!(diff.kept, vec![cmdvar(CmdVarKind::Text, "host")]);
     }
 }
