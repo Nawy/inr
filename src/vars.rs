@@ -1,7 +1,7 @@
 use crate::crypto::{self, DerivedKey};
-use crate::db::{self, env_repo};
+use crate::db::{self, commands_repo, env_repo};
 use crate::interactive;
-use crate::models::{CmdVarKind, CmdVariable, EnvKind};
+use crate::models::{CmdVarKind, CmdVariable, EnvKind, StoredCommandVariable};
 use crate::shell::{BindingSource, ResolvedVar};
 use crate::tui::{self, EnvLookupAutocomplete};
 use anyhow::{anyhow, Result};
@@ -21,6 +21,14 @@ pub struct KeyCache<'a> {
 impl<'a> KeyCache<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn, key: None }
+    }
+
+    /// Test-only: builds a `KeyCache` with the key already unlocked, so
+    /// tests can exercise the secret-decryption path without going through
+    /// an interactive password prompt.
+    #[cfg(test)]
+    pub(crate) fn preloaded(conn: &'a Connection, key: DerivedKey) -> Self {
+        Self { conn, key: Some(key) }
     }
 
     pub fn get(&mut self) -> Result<&DerivedKey> {
@@ -63,16 +71,51 @@ fn decrypt_env_value(keys: &mut KeyCache, env: &crate::models::StoredEnv) -> Res
 }
 
 /// Prompts for one command variable's value at run time. Returns `Ok(None)`
-/// if the user cancelled (Esc).
+/// if the user cancelled (Esc). If `var` has a default env set and that env
+/// still exists, it's used with zero prompts (secret defaults still go
+/// through `KeyCache`, same as an explicit `@`-lookup) - otherwise this
+/// falls back to the normal manual prompt, after printing a one-line notice
+/// if the default was set but its env has since been deleted.
 pub fn resolve_variable(
     conn: &Rc<Connection>,
     keys: &mut KeyCache,
-    var: &CmdVariable,
+    var: &StoredCommandVariable,
 ) -> Result<Option<ResolvedVar>> {
-    match var.kind {
-        CmdVarKind::Secret => resolve_secret_variable(conn, keys, var),
-        CmdVarKind::Text | CmdVarKind::Number => resolve_literal_or_env_variable(conn, var),
+    if let Some(env_id) = &var.default_env_id {
+        match env_repo::get_by_id(conn, env_id)? {
+            Some(env) => return resolve_from_default_env(keys, &var.var, env).map(Some),
+            None => println!(
+                "Default env for '{}' no longer exists - enter a value:",
+                var.var.name
+            ),
+        }
     }
+    match var.var.kind {
+        CmdVarKind::Secret => resolve_secret_variable(conn, keys, &var.var),
+        CmdVarKind::Text | CmdVarKind::Number => resolve_literal_or_env_variable(conn, &var.var),
+    }
+}
+
+/// Resolves a variable straight from its default env - no prompt at all.
+/// Defense in depth: the kind compatibility was already guaranteed at the
+/// time the default was set (`vars::prompt_default_env_choice`, added in
+/// the next task, only offers compatible envs), this just double-checks it
+/// never silently drifted.
+fn resolve_from_default_env(
+    keys: &mut KeyCache,
+    var: &CmdVariable,
+    env: crate::models::StoredEnv,
+) -> Result<ResolvedVar> {
+    debug_assert!(env.kind.compatible_with(var.kind));
+    let value = match env.kind {
+        EnvKind::Secret => decrypt_env_value(keys, &env)?,
+        _ => Zeroizing::new(String::from_utf8_lossy(&env.value).to_string()),
+    };
+    Ok(ResolvedVar {
+        var: var.clone(),
+        value,
+        source: BindingSource::Env(env.name.clone()),
+    })
 }
 
 fn resolve_literal_or_env_variable(
@@ -183,4 +226,72 @@ fn resolve_secret_variable(
         value,
         source: BindingSource::Env(env.name.clone()),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{self, env_repo};
+    use crate::models::{CmdVarKind, EnvKind, StoredEnv};
+    use crate::shell::BindingSource;
+
+    fn text_env(id: &str, name: &str, value: &str) -> StoredEnv {
+        StoredEnv {
+            id: id.to_string(),
+            name: name.to_string(),
+            kind: EnvKind::Text,
+            value: value.as_bytes().to_vec(),
+            nonce: None,
+            description: String::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_variable_uses_default_env_without_prompting_for_text_kind() {
+        let conn = db::open_in_memory().unwrap();
+        env_repo::insert_env(&conn, &text_env("env1", "username", "alice")).unwrap();
+        let conn = Rc::new(conn);
+        let mut keys = KeyCache::new(conn.as_ref());
+
+        let var = StoredCommandVariable {
+            var: CmdVariable { kind: CmdVarKind::Text, name: "user".to_string() },
+            default_env_id: Some("env1".to_string()),
+        };
+
+        let resolved = resolve_variable(&conn, &mut keys, &var).unwrap().unwrap();
+        assert_eq!(resolved.value.as_str(), "alice");
+        assert_eq!(resolved.source, BindingSource::Env("username".to_string()));
+    }
+
+    #[test]
+    fn resolve_variable_uses_default_env_for_secret_and_decrypts_with_preloaded_key() {
+        let conn = db::open_in_memory().unwrap();
+        let salt = crypto::random_salt();
+        let key = crypto::derive_key("hunter2", &salt).unwrap();
+        let (nonce, cipher) = crypto::encrypt(&key, b"sk-secret").unwrap();
+        let env = StoredEnv {
+            id: "env1".to_string(),
+            name: "apikey".to_string(),
+            kind: EnvKind::Secret,
+            value: cipher,
+            nonce: Some(nonce.to_vec()),
+            description: String::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        env_repo::insert_env(&conn, &env).unwrap();
+        let conn = Rc::new(conn);
+        let mut keys = KeyCache::preloaded(conn.as_ref(), key);
+
+        let var = StoredCommandVariable {
+            var: CmdVariable { kind: CmdVarKind::Secret, name: "token".to_string() },
+            default_env_id: Some("env1".to_string()),
+        };
+
+        let resolved = resolve_variable(&conn, &mut keys, &var).unwrap().unwrap();
+        assert_eq!(resolved.value.as_str(), "sk-secret");
+        assert_eq!(resolved.source, BindingSource::Env("apikey".to_string()));
+    }
 }

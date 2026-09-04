@@ -458,7 +458,7 @@ mod tests {
 
         let vars = commands_repo::get_command_variables(&conn, "cmd1").unwrap();
         assert_eq!(vars.len(), 2);
-        assert_eq!(vars[0].name, "host");
-        assert_eq!(vars[1].name, "port");
+        assert_eq!(vars[0].var.name, "host");
+        assert_eq!(vars[1].var.name, "port");
     }
 }

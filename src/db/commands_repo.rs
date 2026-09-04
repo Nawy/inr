@@ -1,6 +1,8 @@
-use crate::models::{CmdVarKind, CmdVariable, StoredCommand};
+use crate::db::env_repo;
+use crate::models::{CmdVarKind, CmdVariable, StoredCommand, StoredCommandVariable};
 use anyhow::Result;
 use rusqlite::{params, Connection, Row};
+use std::collections::BTreeMap;
 
 fn map_row(row: &Row) -> rusqlite::Result<StoredCommand> {
     Ok(StoredCommand {
@@ -36,13 +38,7 @@ pub fn insert_command_raw(
         "INSERT INTO commands (id, template, description, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![cmd.id, cmd.template, cmd.description, cmd.created_at, cmd.updated_at],
     )?;
-    for (i, v) in vars.iter().enumerate() {
-        conn.execute(
-            "INSERT INTO command_variables (command_id, position, kind, name) VALUES (?1, ?2, ?3, ?4)",
-            params![cmd.id, i as i64, v.kind.as_str(), v.name],
-        )?;
-    }
-    Ok(())
+    set_command_variables(conn, &cmd.id, vars, &[])
 }
 
 pub fn get_command(conn: &Connection, id: &str) -> Result<Option<StoredCommand>> {
@@ -85,21 +81,107 @@ pub fn list_all(conn: &Connection) -> Result<Vec<StoredCommand>> {
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
 }
 
-pub fn get_command_variables(conn: &Connection, command_id: &str) -> Result<Vec<CmdVariable>> {
+pub fn get_command_variables(conn: &Connection, command_id: &str) -> Result<Vec<StoredCommandVariable>> {
     let mut stmt = conn.prepare(
-        "SELECT kind, name FROM command_variables WHERE command_id = ?1 ORDER BY position ASC",
+        "SELECT kind, name, default_env_id FROM command_variables WHERE command_id = ?1 ORDER BY position ASC",
     )?;
     let rows = stmt.query_map(params![command_id], |row| {
         let kind_str: String = row.get(0)?;
         let name: String = row.get(1)?;
-        Ok((kind_str, name))
+        let default_env_id: Option<String> = row.get(2)?;
+        Ok((kind_str, name, default_env_id))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (kind_str, name) = row?;
+        let (kind_str, name, default_env_id) = row?;
         let kind = CmdVarKind::from_str(&kind_str)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
-        out.push(CmdVariable { kind, name });
+        out.push(StoredCommandVariable {
+            var: CmdVariable { kind, name },
+            default_env_id,
+        });
+    }
+    Ok(out)
+}
+
+/// Replaces every stored variable for `command_id` with `new_vars`, in
+/// order (so `position` always matches the template's current variable
+/// order). A variable in `new_vars` whose (name, kind) matches one in
+/// `previous` keeps that variable's `default_env_id`; anything else - a
+/// brand new variable, or one whose kind changed - starts with no default.
+/// Used both for a fresh command (`previous` empty) and for `inr e`
+/// re-saving an edited template.
+pub fn set_command_variables(
+    conn: &Connection,
+    command_id: &str,
+    new_vars: &[CmdVariable],
+    previous: &[StoredCommandVariable],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM command_variables WHERE command_id = ?1",
+        params![command_id],
+    )?;
+    for (i, v) in new_vars.iter().enumerate() {
+        let default_env_id = previous
+            .iter()
+            .find(|p| p.var.name == v.name && p.var.kind == v.kind)
+            .and_then(|p| p.default_env_id.clone());
+        conn.execute(
+            "INSERT INTO command_variables (command_id, position, kind, name, default_env_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![command_id, i as i64, v.kind.as_str(), v.name, default_env_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Sets (or, with `None`, clears) one variable's default env by name.
+pub fn set_default_env(
+    conn: &Connection,
+    command_id: &str,
+    var_name: &str,
+    default_env_id: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE command_variables SET default_env_id = ?1 WHERE command_id = ?2 AND name = ?3",
+        params![default_env_id, command_id, var_name],
+    )?;
+    Ok(())
+}
+
+/// Updates a command's editable fields (used by `inr e`). Variables are
+/// updated separately via `set_command_variables` - the FTS trigger
+/// `commands_au` reindexes `template`/`description` automatically.
+pub fn update_command(
+    conn: &Connection,
+    id: &str,
+    template: &str,
+    description: &str,
+    updated_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE commands SET template = ?1, description = ?2, updated_at = ?3 WHERE id = ?4",
+        params![template, description, updated_at, id],
+    )?;
+    Ok(())
+}
+
+/// Maps each variable name that has a default env to that env's *name*,
+/// skipping any default whose env id no longer resolves to a real env.
+/// Used by `inr export` - export carries default envs by name (see
+/// `transfer::ExportedCommand::variable_defaults`), never by id, since ids
+/// are only meaningful within the machine that generated them.
+pub fn get_variable_default_names(
+    conn: &Connection,
+    command_id: &str,
+) -> Result<BTreeMap<String, String>> {
+    let vars = get_command_variables(conn, command_id)?;
+    let mut out = BTreeMap::new();
+    for v in vars {
+        if let Some(env_id) = v.default_env_id {
+            if let Some(env) = env_repo::get_by_id(conn, &env_id)? {
+                out.insert(v.var.name, env.name);
+            }
+        }
     }
     Ok(out)
 }
@@ -176,7 +258,111 @@ mod tests {
         assert_eq!(fetched.template, "ssh %s:host");
 
         let fetched_vars = get_command_variables(&conn, "id1").unwrap();
-        assert_eq!(fetched_vars, vars);
+        assert_eq!(fetched_vars.len(), 1);
+        assert_eq!(fetched_vars[0].var, vars[0]);
+        assert_eq!(fetched_vars[0].default_env_id, None);
+    }
+
+    #[test]
+    fn set_default_env_updates_only_the_named_variable() {
+        let mut conn = open_in_memory().unwrap();
+        let vars = vec![
+            CmdVariable { kind: CmdVarKind::Secret, name: "host".to_string() },
+            CmdVariable { kind: CmdVarKind::Text, name: "user".to_string() },
+        ];
+        insert_command(&mut conn, &sample("id1", "ssh %s:host@%t:user", "ssh"), &vars).unwrap();
+
+        set_default_env(&conn, "id1", "host", Some("env1")).unwrap();
+
+        let fetched = get_command_variables(&conn, "id1").unwrap();
+        let host = fetched.iter().find(|v| v.var.name == "host").unwrap();
+        let user = fetched.iter().find(|v| v.var.name == "user").unwrap();
+        assert_eq!(host.default_env_id, Some("env1".to_string()));
+        assert_eq!(user.default_env_id, None);
+
+        set_default_env(&conn, "id1", "host", None).unwrap();
+        let fetched = get_command_variables(&conn, "id1").unwrap();
+        assert_eq!(fetched.iter().find(|v| v.var.name == "host").unwrap().default_env_id, None);
+    }
+
+    #[test]
+    fn set_command_variables_carries_default_when_name_and_kind_match() {
+        let mut conn = open_in_memory().unwrap();
+        let vars = vec![CmdVariable { kind: CmdVarKind::Text, name: "host".to_string() }];
+        insert_command(&mut conn, &sample("id1", "ping %t:host", "ping"), &vars).unwrap();
+        set_default_env(&conn, "id1", "host", Some("env1")).unwrap();
+
+        let previous = get_command_variables(&conn, "id1").unwrap();
+        let new_vars = vec![
+            CmdVariable { kind: CmdVarKind::Text, name: "host".to_string() },
+            CmdVariable { kind: CmdVarKind::Number, name: "count".to_string() },
+        ];
+        set_command_variables(&conn, "id1", &new_vars, &previous).unwrap();
+
+        let fetched = get_command_variables(&conn, "id1").unwrap();
+        assert_eq!(fetched.len(), 2);
+        assert_eq!(fetched[0].var.name, "host");
+        assert_eq!(fetched[0].default_env_id, Some("env1".to_string()));
+        assert_eq!(fetched[1].var.name, "count");
+        assert_eq!(fetched[1].default_env_id, None);
+    }
+
+    #[test]
+    fn set_command_variables_drops_default_when_kind_changes() {
+        let mut conn = open_in_memory().unwrap();
+        let vars = vec![CmdVariable { kind: CmdVarKind::Text, name: "count".to_string() }];
+        insert_command(&mut conn, &sample("id1", "echo %t:count", "echo"), &vars).unwrap();
+        set_default_env(&conn, "id1", "count", Some("env1")).unwrap();
+
+        let previous = get_command_variables(&conn, "id1").unwrap();
+        let new_vars = vec![CmdVariable { kind: CmdVarKind::Number, name: "count".to_string() }];
+        set_command_variables(&conn, "id1", &new_vars, &previous).unwrap();
+
+        let fetched = get_command_variables(&conn, "id1").unwrap();
+        assert_eq!(fetched[0].default_env_id, None);
+    }
+
+    #[test]
+    fn update_command_changes_template_and_description() {
+        let mut conn = open_in_memory().unwrap();
+        insert_command(&mut conn, &sample("id1", "echo old", "old desc"), &[]).unwrap();
+
+        update_command(&conn, "id1", "echo new", "new desc", "2026-02-01T00:00:00Z").unwrap();
+
+        let fetched = get_command(&conn, "id1").unwrap().unwrap();
+        assert_eq!(fetched.template, "echo new");
+        assert_eq!(fetched.description, "new desc");
+        assert_eq!(fetched.updated_at, "2026-02-01T00:00:00Z");
+    }
+
+    #[test]
+    fn get_variable_default_names_only_includes_resolvable_defaults() {
+        let mut conn = open_in_memory().unwrap();
+        let vars = vec![
+            CmdVariable { kind: CmdVarKind::Text, name: "host".to_string() },
+            CmdVariable { kind: CmdVarKind::Text, name: "user".to_string() },
+        ];
+        insert_command(&mut conn, &sample("id1", "ssh %t:host@%t:user", "ssh"), &vars).unwrap();
+
+        let env = crate::models::StoredEnv {
+            id: "env1".to_string(),
+            name: "myhost".to_string(),
+            kind: crate::models::EnvKind::Text,
+            value: b"example.com".to_vec(),
+            nonce: None,
+            description: String::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        crate::db::env_repo::insert_env(&conn, &env).unwrap();
+
+        set_default_env(&conn, "id1", "host", Some("env1")).unwrap();
+        // "user" points at an id that doesn't exist - must be skipped, not error.
+        set_default_env(&conn, "id1", "user", Some("does-not-exist")).unwrap();
+
+        let names = get_variable_default_names(&conn, "id1").unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names.get("host"), Some(&"myhost".to_string()));
     }
 
     #[test]
