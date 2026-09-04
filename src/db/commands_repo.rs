@@ -177,10 +177,10 @@ pub fn get_variable_default_names(
     let vars = get_command_variables(conn, command_id)?;
     let mut out = BTreeMap::new();
     for v in vars {
-        if let Some(env_id) = v.default_env_id {
-            if let Some(env) = env_repo::get_by_id(conn, &env_id)? {
-                out.insert(v.var.name, env.name);
-            }
+        if let Some(env_id) = v.default_env_id
+            && let Some(env) = env_repo::get_by_id(conn, &env_id)?
+        {
+            out.insert(v.var.name, env.name);
         }
     }
     Ok(out)

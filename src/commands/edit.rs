@@ -104,10 +104,10 @@ fn load_current_defaults(conn: &Connection, command_id: &str) -> Result<HashMap<
     let vars = commands_repo::get_command_variables(conn, command_id)?;
     let mut out = HashMap::new();
     for v in vars {
-        if let Some(env_id) = v.default_env_id {
-            if let Some(env) = env_repo::get_by_id(conn, &env_id)? {
-                out.insert(v.var.name, env);
-            }
+        if let Some(env_id) = v.default_env_id
+            && let Some(env) = env_repo::get_by_id(conn, &env_id)?
+        {
+            out.insert(v.var.name, env);
         }
     }
     Ok(out)
