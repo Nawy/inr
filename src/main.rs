@@ -33,6 +33,11 @@ enum Commands {
         /// The command's nanoid
         id: String,
     },
+    /// Edit a command's description and text, interactively
+    E {
+        /// The command's nanoid
+        id: String,
+    },
     /// Initialize inr (set the master password)
     I,
     /// Show recent execution history
@@ -77,6 +82,7 @@ fn main() -> anyhow::Result<()> {
         Commands::S => commands::search::run(),
         Commands::A { template } => commands::add::run(template),
         Commands::D { id } => commands::delete::run(id),
+        Commands::E { id } => commands::edit::run(id),
         Commands::I => commands::init::run(),
         Commands::H => commands::history::run(),
         Commands::Env { action } => match action {
