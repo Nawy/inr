@@ -59,14 +59,22 @@ pub fn run(path: String) -> Result<()> {
     let mut replaced_commands = 0;
     let mut replaced_envs = 0;
 
+    let mut pending_defaults: Vec<(String, std::collections::BTreeMap<String, String>)> = Vec::new();
+
     for ec in new_commands {
+        let command_id = ec.id.clone();
+        let defaults = ec.variable_defaults.clone();
         insert_exported_command(&tx, ec)?;
+        pending_defaults.push((command_id, defaults));
         imported_commands += 1;
     }
     for (conflict, use_incoming) in cmd_conflicts.into_iter().zip(cmd_resolutions) {
         if use_incoming {
             commands_repo::delete_command(&tx, &conflict.local.id)?;
+            let command_id = conflict.incoming.id.clone();
+            let defaults = conflict.incoming.variable_defaults.clone();
             insert_exported_command(&tx, conflict.incoming)?;
+            pending_defaults.push((command_id, defaults));
             replaced_commands += 1;
         }
     }
@@ -85,6 +93,8 @@ pub fn run(path: String) -> Result<()> {
         }
     }
 
+    let (linked_defaults, skipped_defaults) = apply_variable_defaults(&tx, &pending_defaults)?;
+
     tx.commit()?;
 
     println!(
@@ -92,6 +102,12 @@ pub fn run(path: String) -> Result<()> {
          replaced {replaced_commands} command(s) and {replaced_envs} env(s) with the incoming version; \
          kept {kept_commands} command(s) and {kept_envs} env(s) as-is."
     );
+    if linked_defaults > 0 || skipped_defaults > 0 {
+        println!(
+            "Linked {linked_defaults} default env setting(s); skipped {skipped_defaults} \
+             (no matching compatible env on this machine)."
+        );
+    }
     Ok(())
 }
 
@@ -333,6 +349,39 @@ fn build_stored_env(ee: ExportedEnv, dest_key: Option<&DerivedKey>) -> Result<St
     })
 }
 
+/// Applies each command's carried default-env settings (variable name ->
+/// default env *name*) against the destination's own env table, linking by
+/// name and skipping anything that doesn't resolve to a locally-present,
+/// kind-compatible env. Returns (linked, skipped) counts for the summary
+/// line. Deliberately not folded into `insert_exported_command` - this
+/// runs as a separate pass after every command *and* env for this import
+/// has already been written, since a default might reference an env that
+/// arrives later in the same file.
+fn apply_variable_defaults(
+    conn: &rusqlite::Connection,
+    pending: &[(String, std::collections::BTreeMap<String, String>)],
+) -> Result<(usize, usize)> {
+    let mut linked = 0;
+    let mut skipped = 0;
+    for (command_id, defaults) in pending {
+        let vars = commands_repo::get_command_variables(conn, command_id)?;
+        for (var_name, env_name) in defaults {
+            let resolved = env_repo::find_by_name(conn, env_name)?.filter(|env| {
+                vars.iter()
+                    .any(|v| &v.var.name == var_name && env.kind.compatible_with(v.var.kind))
+            });
+            match resolved {
+                Some(env) => {
+                    commands_repo::set_default_env(conn, command_id, var_name, Some(&env.id))?;
+                    linked += 1;
+                }
+                None => skipped += 1,
+            }
+        }
+    }
+    Ok((linked, skipped))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +510,90 @@ mod tests {
         assert_eq!(vars.len(), 2);
         assert_eq!(vars[0].var.name, "host");
         assert_eq!(vars[1].var.name, "port");
+    }
+
+    fn exported_command_with_defaults(
+        template: &str,
+        description: &str,
+        variable_defaults: &[(&str, &str)],
+    ) -> ExportedCommand {
+        ExportedCommand {
+            variable_defaults: variable_defaults
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..exported_command(template, description)
+        }
+    }
+
+    fn test_key() -> DerivedKey {
+        let salt = crypto::random_salt();
+        crypto::derive_key("test-password", &salt).unwrap()
+    }
+
+    #[test]
+    fn apply_variable_defaults_links_when_compatible_env_exists_locally() {
+        let conn = open_in_memory().unwrap();
+        insert_exported_command(
+            &conn,
+            exported_command_with_defaults("curl %t:region", "curl", &[("region", "region")]),
+        )
+        .unwrap();
+        let env = build_stored_env(exported_env("region", "text", "us-east"), None).unwrap();
+        env_repo::insert_env(&conn, &env).unwrap();
+
+        let pending = vec![(
+            "cmd1".to_string(),
+            std::collections::BTreeMap::from([("region".to_string(), "region".to_string())]),
+        )];
+        let (linked, skipped) = apply_variable_defaults(&conn, &pending).unwrap();
+        assert_eq!(linked, 1);
+        assert_eq!(skipped, 0);
+
+        let vars = commands_repo::get_command_variables(&conn, "cmd1").unwrap();
+        assert_eq!(vars[0].default_env_id, Some(env.id));
+    }
+
+    #[test]
+    fn apply_variable_defaults_skips_when_no_matching_env_locally() {
+        let conn = open_in_memory().unwrap();
+        insert_exported_command(
+            &conn,
+            exported_command_with_defaults("curl %t:region", "curl", &[("region", "region")]),
+        )
+        .unwrap();
+
+        let pending = vec![(
+            "cmd1".to_string(),
+            std::collections::BTreeMap::from([("region".to_string(), "region".to_string())]),
+        )];
+        let (linked, skipped) = apply_variable_defaults(&conn, &pending).unwrap();
+        assert_eq!(linked, 0);
+        assert_eq!(skipped, 1);
+
+        let vars = commands_repo::get_command_variables(&conn, "cmd1").unwrap();
+        assert_eq!(vars[0].default_env_id, None);
+    }
+
+    #[test]
+    fn apply_variable_defaults_skips_when_local_env_kind_is_incompatible() {
+        let conn = open_in_memory().unwrap();
+        insert_exported_command(
+            &conn,
+            exported_command_with_defaults("curl %t:region", "curl", &[("region", "region")]),
+        )
+        .unwrap();
+        // A local env named "region" exists, but it's a secret - not
+        // compatible with a %t: (text) variable.
+        let env = build_stored_env(exported_env("region", "secret", "us-east"), Some(&test_key())).unwrap();
+        env_repo::insert_env(&conn, &env).unwrap();
+
+        let pending = vec![(
+            "cmd1".to_string(),
+            std::collections::BTreeMap::from([("region".to_string(), "region".to_string())]),
+        )];
+        let (linked, skipped) = apply_variable_defaults(&conn, &pending).unwrap();
+        assert_eq!(linked, 0);
+        assert_eq!(skipped, 1);
     }
 }
