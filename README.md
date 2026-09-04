@@ -84,6 +84,7 @@ inr s
 | `inr a <command>` | Save a new command. Any `%s:`/`%t:`/`%n:` placeholders are parsed out as variables; you're then asked for a searchable description. |
 | `inr s` | Search saved commands and run the selected one. Prompts for each of its variables' values, then executes it in your terminal. |
 | `inr d <id>` | Delete a saved command by its id (asks for confirmation). |
+| `inr e <id>` | Edit a command's description and text interactively; editing the text re-parses its `%s:`/`%t:`/`%n:` variables and asks to confirm if they changed. |
 | `inr h` | Show recent execution history — timestamp, command, and which values/envs were used. Secret values are never recorded, only that a variable came from a named env (`@envname`) or was entered directly (shown as hidden). |
 | `inr env a <spec>` | Add an env variable. Prefix the name to set its kind: `s:` secret, `t:` text (default), `nf:` float, `ni:` integer. |
 | `inr env s` | Search env variables; selecting one copies its value to the clipboard. Secret values require the master password and auto-clear from the clipboard after ~20s. |
@@ -119,6 +120,25 @@ prompt library `inr` is built on, doesn't support a field that's masked by
 default but switches to a live search mid-keystroke, so this is an explicit
 menu instead of a magic character.
 
+## Default envs for variables
+
+Any `%s:`/`%t:`/`%n:` variable on a command can have a default env: an env
+whose value fills that variable automatically every time you run the
+command with `inr s`, with no prompt at all. Set it right after `inr a`
+saves a new command, or any time afterward via `inr e <id>` - both walk
+each variable and let you pick a compatible-kind saved env, change it, or
+clear it.
+
+A secret variable with a default still requires your master password to
+decrypt it (same as picking one manually with the secret `@` lookup) - it's
+only the "type it or look it up?" prompt itself that's skipped.
+
+If a default's env is later removed with `inr env r`, nothing breaks and
+nothing is silently repointed: the next time you run that command, `inr s`
+notices the default no longer resolves, prints a one-line notice, and
+falls back to prompting for that variable exactly as if no default had
+ever been set.
+
 ## Sharing between machines
 
 `inr export`/`inr import` move your whole vault — every command and every
@@ -147,6 +167,13 @@ inr import my-inr-backup.inrx
   password. This means importing secrets requires the destination to
   already be initialized (`inr i` already run) — if it isn't, `import`
   stops and tells you to run `inr i` first.
+- **Default envs travel by name, not id.** If a variable has a default env
+  set, `export` records that env's *name*; `import` re-links it against
+  whatever env has that name on the destination, as long as it's still a
+  compatible kind for that variable. If no matching env exists there, the
+  default is simply left unset on import - the command itself still
+  imports normally, and the closing summary reports how many default links
+  were skipped.
 - **Duplicates are resolved interactively.** An env is a duplicate if the
   name already exists locally; a command is a duplicate if its exact
   template text already exists (descriptions may still differ). `import`
