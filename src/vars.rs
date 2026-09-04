@@ -84,7 +84,13 @@ pub fn resolve_variable(
 ) -> Result<Option<ResolvedVar>> {
     if let Some(env_id) = &var.default_env_id {
         match env_repo::get_by_id(conn, env_id)? {
-            Some(env) => return resolve_from_default_env(keys, &var.var, env).map(Some),
+            Some(env) if env.kind.compatible_with(var.var.kind) => {
+                return resolve_from_default_env(keys, &var.var, env).map(Some)
+            }
+            Some(_) => println!(
+                "Default env for '{}' is no longer a compatible kind - enter a value:",
+                var.var.name
+            ),
             None => println!(
                 "Default env for '{}' no longer exists - enter a value:",
                 var.var.name
@@ -99,9 +105,9 @@ pub fn resolve_variable(
 
 /// Resolves a variable straight from its default env - no prompt at all.
 /// Defense in depth: the kind compatibility was already guaranteed at the
-/// time the default was set (`vars::prompt_default_env_choice`, added in
-/// the next task, only offers compatible envs), this just double-checks it
-/// never silently drifted.
+/// time the default was set (`vars::prompt_default_env_choice` only offers
+/// compatible envs) and re-checked by the caller (`resolve_variable`), this
+/// just double-checks it never silently drifted.
 fn resolve_from_default_env(
     keys: &mut KeyCache,
     var: &CmdVariable,
@@ -273,9 +279,19 @@ pub fn prompt_default_env_choice(
         "Remove default" => Ok(DefaultEnvChoice::Cleared),
         _ => {
             let kind_filter = compatible_env_kinds(var.kind);
-            match tui::select_env(conn, &kind_filter, "Search envs:")? {
-                Some(env) => Ok(DefaultEnvChoice::Set(env)),
-                None => Ok(DefaultEnvChoice::Unchanged),
+            loop {
+                match tui::select_env(conn, &kind_filter, "Search envs:")? {
+                    Some(env) if env.kind.compatible_with(var.kind) => {
+                        return Ok(DefaultEnvChoice::Set(env))
+                    }
+                    Some(env) => {
+                        println!(
+                            "'{}' is a {} env, not compatible with a {} variable - pick a different one.",
+                            env.name, env.kind, var.kind
+                        );
+                    }
+                    None => return Ok(DefaultEnvChoice::Unchanged),
+                }
             }
         }
     }

@@ -165,6 +165,26 @@ pub fn update_command(
     Ok(())
 }
 
+/// Updates a command's fields and its full variable set together, in one
+/// transaction (used by `inr e`) - matches `insert_command`'s transactional
+/// pattern, so a failure partway through never leaves `commands.template`
+/// updated while `command_variables` is stale or partially rebuilt.
+pub fn update_command_and_variables(
+    conn: &mut Connection,
+    id: &str,
+    template: &str,
+    description: &str,
+    updated_at: &str,
+    new_vars: &[CmdVariable],
+    previous: &[StoredCommandVariable],
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    update_command(&tx, id, template, description, updated_at)?;
+    set_command_variables(&tx, id, new_vars, previous)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Maps each variable name that has a default env to that env's *name*,
 /// skipping any default whose env id no longer resolves to a real env.
 /// Used by `inr export` - export carries default envs by name (see
@@ -177,10 +197,13 @@ pub fn get_variable_default_names(
     let vars = get_command_variables(conn, command_id)?;
     let mut out = BTreeMap::new();
     for v in vars {
-        if let Some(env_id) = v.default_env_id
-            && let Some(env) = env_repo::get_by_id(conn, &env_id)?
-        {
-            out.insert(v.var.name, env.name);
+        // Nested (not collapsed via a let-chain) to keep this compiling on
+        // the documented rustc 1.85+ floor - let-chains need 1.88+.
+        #[allow(clippy::collapsible_if)]
+        if let Some(env_id) = v.default_env_id {
+            if let Some(env) = env_repo::get_by_id(conn, &env_id)? {
+                out.insert(v.var.name, env.name);
+            }
         }
     }
     Ok(out)
@@ -320,6 +343,48 @@ mod tests {
 
         let fetched = get_command_variables(&conn, "id1").unwrap();
         assert_eq!(fetched[0].default_env_id, None);
+    }
+
+    #[test]
+    fn update_command_and_variables_updates_both_in_one_transaction() {
+        let mut conn = open_in_memory().unwrap();
+        let vars = vec![
+            CmdVariable { kind: CmdVarKind::Text, name: "host".to_string() },
+            CmdVariable { kind: CmdVarKind::Number, name: "port".to_string() },
+        ];
+        insert_command(&mut conn, &sample("id1", "ping %t:host %n:port", "ping"), &vars).unwrap();
+        set_default_env(&conn, "id1", "host", Some("env1")).unwrap();
+
+        let previous = get_command_variables(&conn, "id1").unwrap();
+        // "port" is dropped, "host" is kept (and should carry its default
+        // env forward), "count" is a brand new variable.
+        let new_vars = vec![
+            CmdVariable { kind: CmdVarKind::Text, name: "host".to_string() },
+            CmdVariable { kind: CmdVarKind::Number, name: "count".to_string() },
+        ];
+
+        update_command_and_variables(
+            &mut conn,
+            "id1",
+            "ping %t:host %n:count",
+            "ping new",
+            "2026-02-01T00:00:00Z",
+            &new_vars,
+            &previous,
+        )
+        .unwrap();
+
+        let fetched_cmd = get_command(&conn, "id1").unwrap().unwrap();
+        assert_eq!(fetched_cmd.template, "ping %t:host %n:count");
+        assert_eq!(fetched_cmd.description, "ping new");
+        assert_eq!(fetched_cmd.updated_at, "2026-02-01T00:00:00Z");
+
+        let fetched_vars = get_command_variables(&conn, "id1").unwrap();
+        assert_eq!(fetched_vars.len(), 2);
+        let host = fetched_vars.iter().find(|v| v.var.name == "host").unwrap();
+        assert_eq!(host.default_env_id, Some("env1".to_string()));
+        let count = fetched_vars.iter().find(|v| v.var.name == "count").unwrap();
+        assert_eq!(count.default_env_id, None);
     }
 
     #[test]

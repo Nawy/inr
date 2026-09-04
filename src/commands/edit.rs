@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 pub fn run(id: String) -> Result<()> {
-    let conn = db::open(paths::db_path()?)?;
+    let mut conn = db::open(paths::db_path()?)?;
 
     let Some(cmd) = commands_repo::get_command(&conn, &id)? else {
         println!("No command with id '{id}'.");
@@ -41,8 +41,9 @@ pub fn run(id: String) -> Result<()> {
     }
 
     let now = Utc::now().to_rfc3339();
-    commands_repo::update_command(&conn, &id, &new_template, &new_description, &now)?;
-    commands_repo::set_command_variables(&conn, &id, &new_vars, &old_vars)?;
+    commands_repo::update_command_and_variables(
+        &mut conn, &id, &new_template, &new_description, &now, &new_vars, &old_vars,
+    )?;
     println!("Saved.");
 
     if !new_vars.is_empty() {
@@ -104,10 +105,13 @@ fn load_current_defaults(conn: &Connection, command_id: &str) -> Result<HashMap<
     let vars = commands_repo::get_command_variables(conn, command_id)?;
     let mut out = HashMap::new();
     for v in vars {
-        if let Some(env_id) = v.default_env_id
-            && let Some(env) = env_repo::get_by_id(conn, &env_id)?
-        {
-            out.insert(v.var.name, env);
+        // Nested (not collapsed via a let-chain) to keep this compiling on
+        // the documented rustc 1.85+ floor - let-chains need 1.88+.
+        #[allow(clippy::collapsible_if)]
+        if let Some(env_id) = v.default_env_id {
+            if let Some(env) = env_repo::get_by_id(conn, &env_id)? {
+                out.insert(v.var.name, env);
+            }
         }
     }
     Ok(out)
