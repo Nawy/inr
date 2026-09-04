@@ -16,6 +16,7 @@ right there in your terminal.
 - [Command reference](#command-reference)
 - [Variables and placeholders](#variables-and-placeholders)
 - [The `@` lookup](#the--lookup)
+- [Default envs for variables](#default-envs-for-variables)
 - [Sharing between machines](#sharing-between-machines)
 - [Security model](#security-model)
 - [Data storage](#data-storage)
