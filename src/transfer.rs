@@ -1,6 +1,7 @@
 use crate::crypto::{self, NONCE_LEN, SALT_LEN};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 const MAGIC: &[u8; 4] = b"INRX";
 const FORMAT_VERSION: u8 = 1;
@@ -12,6 +13,13 @@ pub struct ExportedCommand {
     pub description: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Variable name -> default env's *name* (not id - ids are only
+    /// meaningful within the machine that generated them; names are the
+    /// natural key envs are matched by everywhere else). Sparse: only
+    /// variables with a default appear. `serde(default)` so a transfer
+    /// file written before this field existed still decodes cleanly.
+    #[serde(default)]
+    pub variable_defaults: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +113,7 @@ mod tests {
                 description: "connect".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
+                variable_defaults: BTreeMap::from([("host".to_string(), "prod-host".to_string())]),
             }],
             envs: vec![ExportedEnv {
                 id: "env1".to_string(),
@@ -125,6 +134,62 @@ mod tests {
         let decoded = decode(&bytes, "correct horse battery staple").unwrap();
         assert_eq!(decoded.commands[0].template, payload.commands[0].template);
         assert_eq!(decoded.envs[0].value, payload.envs[0].value);
+    }
+
+    #[test]
+    fn encode_decode_roundtrips_variable_defaults() {
+        let payload = sample_payload();
+        let bytes = encode(&payload, "correct horse battery staple").unwrap();
+        let decoded = decode(&bytes, "correct horse battery staple").unwrap();
+        assert_eq!(
+            decoded.commands[0].variable_defaults.get("host"),
+            Some(&"prod-host".to_string())
+        );
+    }
+
+    #[test]
+    fn decode_defaults_variable_defaults_to_empty_when_field_is_absent() {
+        // Simulates a transfer file written before this field existed:
+        // the same payload shape, minus `variable_defaults` in the JSON.
+        #[derive(serde::Serialize)]
+        struct OldExportedCommand {
+            id: String,
+            template: String,
+            description: String,
+            created_at: String,
+            updated_at: String,
+        }
+        #[derive(serde::Serialize)]
+        struct OldPayload {
+            exported_at: String,
+            commands: Vec<OldExportedCommand>,
+            envs: Vec<ExportedEnv>,
+        }
+        let old = OldPayload {
+            exported_at: "2026-01-01T00:00:00Z".to_string(),
+            commands: vec![OldExportedCommand {
+                id: "cmd1".to_string(),
+                template: "echo hi".to_string(),
+                description: "greet".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            }],
+            envs: vec![],
+        };
+        let json = serde_json::to_vec(&old).unwrap();
+        let salt = crypto::random_salt();
+        let key = crypto::derive_key("pw", &salt).unwrap();
+        let (nonce, ciphertext) = crypto::encrypt(&key, &json).unwrap();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(FORMAT_VERSION);
+        bytes.extend_from_slice(&salt);
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&ciphertext);
+
+        let decoded = decode(&bytes, "pw").unwrap();
+        assert!(decoded.commands[0].variable_defaults.is_empty());
     }
 
     #[test]

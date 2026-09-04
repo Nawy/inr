@@ -52,16 +52,17 @@ pub fn run(path: String) -> Result<()> {
         });
     }
 
-    let exported_commands: Vec<ExportedCommand> = commands
-        .iter()
-        .map(|c| ExportedCommand {
+    let mut exported_commands = Vec::with_capacity(commands.len());
+    for c in &commands {
+        exported_commands.push(ExportedCommand {
             id: c.id.clone(),
             template: c.template.clone(),
             description: c.description.clone(),
             created_at: c.created_at.clone(),
             updated_at: c.updated_at.clone(),
-        })
-        .collect();
+            variable_defaults: commands_repo::get_variable_default_names(&conn, &c.id)?,
+        });
+    }
 
     let payload = TransferPayload {
         exported_at: Utc::now().to_rfc3339(),
