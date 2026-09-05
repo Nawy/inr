@@ -107,6 +107,27 @@ Placeholders are just names and kinds at save time — you're prompted for the
 actual value fresh, every time you run the command from `inr s`. That's the
 point: one saved template, reused with different values.
 
+**Don't wrap a placeholder in your own quotes.** `inr` already quotes each
+substituted value for you — a `%t:`/`%n:` value gets wrapped in quotes, a
+`%s:` value becomes an environment-variable reference — so nesting it inside
+quotes you added yourself breaks that quoting instead of reinforcing it.
+Nothing inside a single-quoted shell string ever expands, not even an
+env-var reference, so a template like:
+
+```sh
+echo 'Bye %s:secretname and %t:name!'
+```
+
+silently prints the literal text `$env:INR_SECRET_1` instead of the secret's
+value — the substitution happens *inside* your outer `'...'`, where it can
+never take effect. Write it without the extra quotes instead:
+
+```sh
+echo Bye %s:secretname and %t:name!
+```
+
+and `inr` supplies exactly the quoting each value needs.
+
 ## The `@` lookup
 
 When `inr s` prompts you for a `%t:`/`%n:` variable's value, type `@` to
@@ -206,6 +227,17 @@ inr import my-inr-backup.inrx
   references it by variable name (`$INR_SECRET_1` / `$env:INR_SECRET_1`) —
   never inlined as text. This keeps it out of `ps`/Task Manager output, your
   shell's history file, and `inr`'s own history log.
+- **`inr` itself never prints a secret's plaintext.** Typing a secret's
+  value is masked (`inquire`'s hidden input mode), a secret env's value
+  shows as `***` everywhere it would otherwise appear in a search list, and
+  `inr h`'s history log records only that a variable came from a named env
+  (`@envname`) or was entered directly (`<entered directly, hidden>`) — never
+  the value itself. That guarantee is about `inr`'s own output, though: once
+  a secret is handed to the command you're running, as a real environment
+  variable on that one child process, what the command does with it is up to
+  the command. A template like `echo %s:token` will print the secret to your
+  terminal, on purpose — that's the command choosing to reveal a value it
+  was given, not `inr` leaking one.
 - **Injection safety.** Every non-secret value is shell-quoted before being
   spliced into the command line, so a value containing `;`, `&&`, quotes, or
   `$(...)` is always treated as one literal argument, never as shell syntax.

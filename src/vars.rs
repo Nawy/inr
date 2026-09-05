@@ -5,6 +5,7 @@ use crate::models::{CmdVarKind, CmdVariable, EnvKind, StoredCommandVariable, Sto
 use crate::shell::{BindingSource, ResolvedVar};
 use crate::tui::{self, EnvLookupAutocomplete};
 use anyhow::{anyhow, Result};
+use crossterm::style::{Color, Stylize};
 use inquire::{InquireError, Password, PasswordDisplayMode, Select, Text};
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -254,13 +255,17 @@ pub fn prompt_default_env_choice(
     var: &CmdVariable,
     current: Option<&StoredEnv>,
 ) -> Result<DefaultEnvChoice> {
+    // Green so the variable name jumps out from the surrounding kind/env
+    // detail - this prompt often repeats once per variable on a multi-
+    // variable command, so the name is what you're scanning for each time.
+    let var_name = var.name.as_str().with(Color::Green).bold();
     let (message, options): (String, Vec<&str>) = match current {
         Some(env) => (
-            format!("{} ({}) - default env is @{}:", var.name, var.kind, env.name),
+            format!("{var_name} ({}) - default env is @{}:", var.kind, env.name),
             vec!["Keep current default", "Change default env", "Remove default"],
         ),
         None => (
-            format!("{} ({}) - set a default env?", var.name, var.kind),
+            format!("{var_name} ({}) - set a default env?", var.kind),
             vec!["No default", "Set a default env"],
         ),
     };
