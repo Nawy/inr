@@ -1,6 +1,6 @@
 [package]
 name = "inr"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A secure, searchable command-line vault for shell commands, secrets, and env variables"
 license = "MIT"
