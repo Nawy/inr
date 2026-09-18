@@ -55,6 +55,15 @@ impl CmdVariable {
     pub fn placeholder(&self) -> String {
         format!("{}{}", self.kind.placeholder_prefix(), self.name)
     }
+
+    /// The bracketed spelling of this placeholder, e.g. `[%n:count]` - used
+    /// in a template to terminate the variable's name before adjacent
+    /// literal text (`[%n:count]ms`). Never actually written for `Secret`
+    /// (rejected by `placeholder::parse_placeholders`), but this is just
+    /// string formatting, so it doesn't need to know that.
+    pub fn bracketed_placeholder(&self) -> String {
+        format!("[{}]", self.placeholder())
+    }
 }
 
 #[derive(Debug, Clone)]

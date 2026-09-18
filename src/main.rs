@@ -68,8 +68,8 @@ enum EnvCommands {
     },
     /// Search env variables and copy the selected value to the clipboard
     S,
-    /// Remove an env variable by id
-    R {
+    /// Delete an env variable by id
+    D {
         /// The env's nanoid
         id: String,
     },
@@ -88,7 +88,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Env { action } => match action {
             EnvCommands::A { name } => commands::env_add::run(name),
             EnvCommands::S => commands::env_search::run(),
-            EnvCommands::R { id } => commands::env_remove::run(id),
+            EnvCommands::D { id } => commands::env_delete::run(id),
         },
         Commands::Export { path } => commands::export::run(path),
         Commands::Import { path } => commands::import::run(path),

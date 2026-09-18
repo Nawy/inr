@@ -2,7 +2,7 @@ pub mod add;
 pub mod delete;
 pub mod edit;
 pub mod env_add;
-pub mod env_remove;
+pub mod env_delete;
 pub mod env_search;
 pub mod export;
 pub mod history;

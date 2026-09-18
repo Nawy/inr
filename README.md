@@ -89,7 +89,7 @@ inr s
 | `inr h` | Show recent execution history — timestamp, command, and which values/envs were used. Secret values are never recorded, only that a variable came from a named env (`@envname`) or was entered directly (shown as hidden). |
 | `inr env a <spec>` | Add an env variable. Prefix the name to set its kind: `s:` secret, `t:` text (default), `nf:` float, `ni:` integer. |
 | `inr env s` | Search env variables; selecting one copies its value to the clipboard. Secret values require the master password and auto-clear from the clipboard after ~20s. |
-| `inr env r <id>` | Remove an env variable by id (asks for confirmation). |
+| `inr env d <id>` | Delete an env variable by id (asks for confirmation). |
 | `inr export <path>` | Export every command and env to an encrypted transfer file, for moving them to another machine. See [Sharing between machines](#sharing-between-machines). |
 | `inr import <path>` | Import commands and envs from a transfer file, merging with what's already here. See [Sharing between machines](#sharing-between-machines). |
 
@@ -106,6 +106,33 @@ A command template can contain placeholders of the form `%<kind>:<name>`:
 Placeholders are just names and kinds at save time — you're prompted for the
 actual value fresh, every time you run the command from `inr s`. That's the
 point: one saved template, reused with different values.
+
+### Bracketed placeholders
+
+A `%t:` or `%n:` placeholder can also be wrapped in brackets —
+`[%t:name]`/`[%n:name]` — to mark exactly where its name ends:
+
+```sh
+echo [%n:amount]ether
+```
+
+Use the bracketed form whenever a placeholder sits directly against other
+text with no space in between, and that text could itself continue as part
+of the name (a letter, digit, or underscore). Without brackets, `inr` reads
+as much of that adjacent text as looks like a name, so `%n:amountether`
+parses as one variable named `amountether`, not `amount` followed by the
+literal `ether`. Brackets remove that ambiguity; the brackets themselves are
+never part of the output — `%n:amount` bound to `13.01` gives
+`13.01ether` either way, once the name is written unambiguously.
+
+You don't need brackets when a placeholder is followed by a space or
+punctuation (`%n:port -p`, `%t:name!`), since nothing there could be
+mistaken for part of the name.
+
+**Secret placeholders can't be bracketed.** `[%s:name]` is rejected the
+moment you try to save or edit the command — a secret's value is never
+inlined as literal text (see below), so there's no adjacent-text case for
+brackets to disambiguate. Use bare `%s:name` for secrets.
 
 **Don't wrap a placeholder in your own quotes.** `inr` already quotes each
 substituted value for you — a `%t:`/`%n:` value gets wrapped in quotes, a
@@ -155,7 +182,7 @@ A secret variable with a default still requires your master password to
 decrypt it (same as picking one manually with the secret `@` lookup) - it's
 only the "type it or look it up?" prompt itself that's skipped.
 
-If a default's env is later removed with `inr env r`, nothing breaks and
+If a default's env is later deleted with `inr env d`, nothing breaks and
 nothing is silently repointed: the next time you run that command, `inr s`
 notices the default no longer resolves, prints a one-line notice, and
 falls back to prompting for that variable exactly as if no default had

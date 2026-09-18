@@ -66,10 +66,12 @@ pub fn is_windows() -> bool {
 }
 
 /// Builds the final, ready-to-run command line by substituting each
-/// variable's placeholder in `template`. Text/number values are
-/// shell-quoted literally; secret values are NEVER substituted as text -
-/// instead an env-var reference is spliced in, and the actual secret is
-/// returned separately to be set only on the child process's environment.
+/// variable's placeholder in `template`, in either its bare (`%t:name`) or
+/// bracketed (`[%t:name]`) spelling - the brackets are delimiters only and
+/// never appear in the output. Text/number values are shell-quoted
+/// literally; secret values are NEVER substituted as text - instead an
+/// env-var reference is spliced in, and the actual secret is returned
+/// separately to be set only on the child process's environment.
 pub fn build_command_line(
     template: &str,
     resolved: &[ResolvedVar],
@@ -79,7 +81,8 @@ pub fn build_command_line(
 
     for (idx, rv) in resolved.iter().enumerate() {
         let placeholder = rv.var.placeholder();
-        if !command_line.contains(&placeholder) {
+        let bracketed = rv.var.bracketed_placeholder();
+        if !command_line.contains(&placeholder) && !command_line.contains(&bracketed) {
             return Err(anyhow!("variable '{}' not found in template", rv.var.name));
         }
         let replacement = match rv.var.kind {
@@ -101,8 +104,11 @@ pub fn build_command_line(
                 reference
             }
         };
-        // Replace every occurrence: the same placeholder may appear more
-        // than once in a template (dedup happens at parse_placeholders).
+        // Replace every occurrence, in both spellings: the same variable
+        // may appear more than once in a template, bracketed or bare
+        // (dedup happens at parse_placeholders). Bracketed occurrences are
+        // replaced first so the brackets never leak into the output.
+        command_line = command_line.replace(&bracketed, &replacement);
         command_line = command_line.replace(&placeholder, &replacement);
     }
 
@@ -242,5 +248,46 @@ mod tests {
             source: BindingSource::Literal,
         }];
         assert!(build_command_line("echo hi", &resolved).is_err());
+    }
+
+    #[test]
+    fn bracketed_number_placeholder_concatenates_with_adjacent_literal_text() {
+        let resolved = vec![ResolvedVar {
+            var: var(CmdVarKind::Number, "number"),
+            value: Zeroizing::new("13.01".to_string()),
+            source: BindingSource::Literal,
+        }];
+        let (line, secrets) = build_command_line("echo [%n:number]ether", &resolved).unwrap();
+        assert!(secrets.is_empty());
+        // brackets are delimiters only - never in the output - and the
+        // value sits directly against the literal suffix, no stray space.
+        assert!(line.contains("13.01ether"), "line was: {line}");
+        assert!(!line.contains('['));
+        assert!(!line.contains(']'));
+    }
+
+    #[test]
+    fn bracketed_text_placeholder_strips_brackets() {
+        let resolved = vec![ResolvedVar {
+            var: var(CmdVarKind::Text, "name"),
+            value: Zeroizing::new("plural".to_string()),
+            source: BindingSource::Literal,
+        }];
+        let (line, _) = build_command_line("echo [%t:name]s", &resolved).unwrap();
+        assert!(line.contains("plurals"), "line was: {line}");
+        assert!(!line.contains('['));
+    }
+
+    #[test]
+    fn bare_and_bracketed_occurrences_of_same_variable_both_substituted() {
+        let resolved = vec![ResolvedVar {
+            var: var(CmdVarKind::Text, "msg"),
+            value: Zeroizing::new("hi".to_string()),
+            source: BindingSource::Literal,
+        }];
+        let (line, _) = build_command_line("echo %t:msg && echo [%t:msg]!", &resolved).unwrap();
+        assert_eq!(line.matches("hi").count(), 2);
+        assert!(line.contains("hi!"));
+        assert!(!line.contains('['));
     }
 }
